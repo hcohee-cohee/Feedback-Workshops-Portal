@@ -1,0 +1,12 @@
+{
+  "name": "feedback-workshop-portal",
+  "version": "1.0.0",
+  "description": "Feedback Workshop Registration Portal for Netflix, Animation Studio & Eyeline",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}
