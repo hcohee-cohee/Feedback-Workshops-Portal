@@ -13,10 +13,6 @@ app.use(express.static(path.join(__dirname, "public")));
 // ============================================================
 // GOOGLE CALENDAR INTEGRATION
 // ============================================================
-// Set the GOOGLE_SERVICE_ACCOUNT environment variable in Render
-// with the contents of your service account JSON key file.
-// The calendar must be shared with the service account email.
-
 let calendarClient = null;
 
 function getCalendarClient() {
@@ -24,7 +20,7 @@ function getCalendarClient() {
   try {
     const creds = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT || "{}");
     if (!creds.client_email) {
-      console.log("Google Calendar: No service account configured. Calendar invites will use .ics files only.");
+      console.log("Google Calendar: No service account configured.");
       return null;
     }
     const auth = new google.auth.GoogleAuth({
@@ -43,27 +39,14 @@ function getCalendarClient() {
 async function addGuestToCalendarEvent(calendarId, eventId, guestEmail, guestName) {
   const cal = getCalendarClient();
   if (!cal || !calendarId || !eventId) return { success: false, reason: "Calendar not configured" };
-
   try {
-    // Get current event to preserve existing guests
     const event = await cal.events.get({ calendarId, eventId });
     const attendees = event.data.attendees || [];
-
-    // Check if already added
     if (attendees.find(a => a.email.toLowerCase() === guestEmail.toLowerCase())) {
       return { success: true, reason: "Already on invite" };
     }
-
-    // Add new guest
     attendees.push({ email: guestEmail, displayName: guestName, responseStatus: "needsAction" });
-
-    await cal.events.patch({
-      calendarId,
-      eventId,
-      sendUpdates: "all", // sends email invite to the new guest
-      requestBody: { attendees },
-    });
-
+    await cal.events.patch({ calendarId, eventId, sendUpdates: "all", requestBody: { attendees } });
     console.log("Calendar: Added " + guestEmail + " to event " + eventId);
     return { success: true };
   } catch (e) {
@@ -72,22 +55,63 @@ async function addGuestToCalendarEvent(calendarId, eventId, guestEmail, guestNam
   }
 }
 
+async function findCalendarEvent(calendarId, session) {
+  const cal = getCalendarClient();
+  if (!cal || !calendarId) return null;
+
+  try {
+    // Parse session time
+    const t = session.time.trim();
+    const m12 = t.match(/^(\d{1,2})(?::(\d{2}))?\s*(AM|PM|am|pm|a|p)\.?m?\.?$/i);
+    const m24 = t.match(/^(\d{1,2}):(\d{2})$/);
+    let hours = 0, mins = 0;
+    if (m12) {
+      hours = parseInt(m12[1]); mins = parseInt(m12[2] || "0");
+      const pm = m12[3].toLowerCase().startsWith("p");
+      if (pm && hours !== 12) hours += 12;
+      if (!pm && hours === 12) hours = 0;
+    } else if (m24) {
+      hours = parseInt(m24[1]); mins = parseInt(m24[2]);
+    }
+
+    // Build time range — search window of 15 min before to 15 min after
+    const startDate = new Date(session.date + "T" + String(hours).padStart(2, "0") + ":" + String(mins).padStart(2, "0") + ":00");
+    const searchStart = new Date(startDate.getTime() - 15 * 60 * 1000);
+    const searchEnd = new Date(startDate.getTime() + 15 * 60 * 1000);
+
+    const res = await cal.events.list({
+      calendarId,
+      timeMin: searchStart.toISOString(),
+      timeMax: searchEnd.toISOString(),
+      timeZone: "America/Los_Angeles",
+      singleEvents: true,
+      orderBy: "startTime",
+    });
+
+    const events = res.data.items || [];
+    if (events.length === 0) {
+      console.log("Calendar: No event found for " + session.title + " on " + session.date + " at " + session.time);
+      return null;
+    }
+
+    // Try to match by title first, then fall back to first event in the window
+    const titleMatch = events.find(e => e.summary && session.title && e.summary.toLowerCase().includes(session.title.toLowerCase().split(":")[0].trim()));
+    const match = titleMatch || events[0];
+    console.log("Calendar: Matched event '" + match.summary + "' (ID: " + match.id + ") for session " + session.title);
+    return match.id;
+  } catch (e) {
+    console.error("Calendar search error:", e.message);
+    return null;
+  }
+}
+
 async function removeGuestFromCalendarEvent(calendarId, eventId, guestEmail) {
   const cal = getCalendarClient();
   if (!cal || !calendarId || !eventId) return;
-
   try {
     const event = await cal.events.get({ calendarId, eventId });
-    const attendees = (event.data.attendees || []).filter(
-      a => a.email.toLowerCase() !== guestEmail.toLowerCase()
-    );
-
-    await cal.events.patch({
-      calendarId,
-      eventId,
-      sendUpdates: "all",
-      requestBody: { attendees },
-    });
+    const attendees = (event.data.attendees || []).filter(a => a.email.toLowerCase() !== guestEmail.toLowerCase());
+    await cal.events.patch({ calendarId, eventId, sendUpdates: "all", requestBody: { attendees } });
     console.log("Calendar: Removed " + guestEmail + " from event " + eventId);
   } catch (e) {
     console.error("Calendar remove error:", e.message);
@@ -105,30 +129,31 @@ function getDefaultData() {
       adminCode: "admin2026",
       entities: ["Netflix", "Netflix Animation Studio", "Eyeline"],
       categories: ["Netflix Workshop", "Animation Studio Workshop", "Eyeline Workshop"],
+      calendarId: "",
       sendConfirmationEmails: false,
       sendWaitlistEmails: false
     },
     sessions: [
-      { id: "S001", title: "Feedback Fundamentals", description: "Learn core principles of giving and receiving constructive feedback in a collaborative setting.", date: "2026-05-07", time: "1:00 PM", duration: 90, category: "Netflix Workshop", capacity: 25, externalEntityCap: 5, restrictedToEntity: "", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarId: "", calendarEventId: "", status: "Active" },
-      { id: "S002", title: "Feedback Fundamentals", description: "Learn core principles of giving and receiving constructive feedback in a collaborative setting.", date: "2026-05-07", time: "4:00 PM", duration: 90, category: "Netflix Workshop", capacity: 25, externalEntityCap: 5, restrictedToEntity: "", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarId: "", calendarEventId: "", status: "Active" },
-      { id: "S003", title: "Feedback Fundamentals", description: "Learn core principles of giving and receiving constructive feedback in a collaborative setting.", date: "2026-05-07", time: "7:00 PM", duration: 90, category: "Netflix Workshop", capacity: 25, externalEntityCap: 5, restrictedToEntity: "", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarId: "", calendarEventId: "", status: "Active" },
-      { id: "S004", title: "Feedback in Practice — Small Group", description: "Hands-on practice session with live feedback exercises and coaching in a small group format.", date: "2026-05-14", time: "9:00 AM", duration: 90, category: "Netflix Workshop", capacity: 20, externalEntityCap: 5, restrictedToEntity: "", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarId: "", calendarEventId: "", status: "Active" },
-      { id: "S005", title: "Feedback in Practice — Small Group", description: "Hands-on practice session with live feedback exercises and coaching in a small group format.", date: "2026-05-14", time: "12:00 PM", duration: 90, category: "Netflix Workshop", capacity: 20, externalEntityCap: 5, restrictedToEntity: "", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarId: "", calendarEventId: "", status: "Active" },
-      { id: "S006", title: "Feedback in Practice — Small Group", description: "Hands-on practice session with live feedback exercises and coaching in a small group format.", date: "2026-05-14", time: "3:00 PM", duration: 90, category: "Netflix Workshop", capacity: 20, externalEntityCap: 5, restrictedToEntity: "", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarId: "", calendarEventId: "", status: "Active" },
-      { id: "S007", title: "Animation Studio: Feedback Foundations", description: "Tailored feedback workshop for Netflix Animation Studio teams.", date: "2026-05-21", time: "10:00 AM", duration: 90, category: "Animation Studio Workshop", capacity: 10, externalEntityCap: 0, restrictedToEntity: "Netflix Animation Studio", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarId: "", calendarEventId: "", status: "Active" },
-      { id: "S008", title: "Animation Studio: Feedback Foundations", description: "Tailored feedback workshop for Netflix Animation Studio teams.", date: "2026-05-21", time: "1:00 PM", duration: 90, category: "Animation Studio Workshop", capacity: 10, externalEntityCap: 0, restrictedToEntity: "Netflix Animation Studio", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarId: "", calendarEventId: "", status: "Active" },
-      { id: "S009", title: "Eyeline: Feedback Foundations", description: "Tailored feedback workshop for Eyeline teams.", date: "2026-05-28", time: "10:00 AM", duration: 90, category: "Eyeline Workshop", capacity: 10, externalEntityCap: 0, restrictedToEntity: "Eyeline", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarId: "", calendarEventId: "", status: "Active" },
-      { id: "S010", title: "Eyeline: Feedback Foundations", description: "Tailored feedback workshop for Eyeline teams.", date: "2026-05-28", time: "1:00 PM", duration: 90, category: "Eyeline Workshop", capacity: 10, externalEntityCap: 0, restrictedToEntity: "Eyeline", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarId: "", calendarEventId: "", status: "Active" },
-      { id: "S011", title: "Advanced Feedback: Difficult Conversations", description: "Navigate challenging feedback scenarios with confidence. Covers upward feedback, cross-functional dynamics, and high-stakes situations.", date: "2026-06-04", time: "1:00 PM", duration: 90, category: "Netflix Workshop", capacity: 25, externalEntityCap: 5, restrictedToEntity: "", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarId: "", calendarEventId: "", status: "Active" },
-      { id: "S012", title: "Advanced Feedback: Difficult Conversations", description: "Navigate challenging feedback scenarios with confidence. Covers upward feedback, cross-functional dynamics, and high-stakes situations.", date: "2026-06-04", time: "4:00 PM", duration: 90, category: "Netflix Workshop", capacity: 25, externalEntityCap: 5, restrictedToEntity: "", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarId: "", calendarEventId: "", status: "Active" },
-      { id: "S013", title: "Advanced Feedback: Difficult Conversations", description: "Navigate challenging feedback scenarios with confidence. Covers upward feedback, cross-functional dynamics, and high-stakes situations.", date: "2026-06-04", time: "7:00 PM", duration: 90, category: "Netflix Workshop", capacity: 25, externalEntityCap: 5, restrictedToEntity: "", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarId: "", calendarEventId: "", status: "Active" },
-      { id: "S014", title: "Feedback Culture Deep Dive", description: "Explore how to embed a feedback-first culture within your team. Interactive discussion and action planning.", date: "2026-06-18", time: "9:00 AM", duration: 60, category: "Netflix Workshop", capacity: 20, externalEntityCap: 5, restrictedToEntity: "", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarId: "", calendarEventId: "", status: "Active" },
-      { id: "S015", title: "Feedback Culture Deep Dive", description: "Explore how to embed a feedback-first culture within your team. Interactive discussion and action planning.", date: "2026-06-18", time: "12:00 PM", duration: 60, category: "Netflix Workshop", capacity: 20, externalEntityCap: 5, restrictedToEntity: "", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarId: "", calendarEventId: "", status: "Active" },
-      { id: "S016", title: "Feedback Culture Deep Dive", description: "Explore how to embed a feedback-first culture within your team. Interactive discussion and action planning.", date: "2026-06-18", time: "3:00 PM", duration: 60, category: "Netflix Workshop", capacity: 20, externalEntityCap: 5, restrictedToEntity: "", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarId: "", calendarEventId: "", status: "Active" },
-      { id: "S017", title: "Animation Studio: Advanced Feedback", description: "Advanced feedback techniques tailored for Animation Studio creative teams.", date: "2026-06-25", time: "10:00 AM", duration: 90, category: "Animation Studio Workshop", capacity: 10, externalEntityCap: 0, restrictedToEntity: "Netflix Animation Studio", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarId: "", calendarEventId: "", status: "Active" },
-      { id: "S018", title: "Animation Studio: Advanced Feedback", description: "Advanced feedback techniques tailored for Animation Studio creative teams.", date: "2026-06-25", time: "1:00 PM", duration: 90, category: "Animation Studio Workshop", capacity: 10, externalEntityCap: 0, restrictedToEntity: "Netflix Animation Studio", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarId: "", calendarEventId: "", status: "Active" },
-      { id: "S019", title: "Eyeline: Advanced Feedback", description: "Advanced feedback techniques tailored for Eyeline teams.", date: "2026-07-02", time: "10:00 AM", duration: 90, category: "Eyeline Workshop", capacity: 10, externalEntityCap: 0, restrictedToEntity: "Eyeline", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarId: "", calendarEventId: "", status: "Active" },
-      { id: "S020", title: "Eyeline: Advanced Feedback", description: "Advanced feedback techniques tailored for Eyeline teams.", date: "2026-07-02", time: "1:00 PM", duration: 90, category: "Eyeline Workshop", capacity: 10, externalEntityCap: 0, restrictedToEntity: "Eyeline", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarId: "", calendarEventId: "", status: "Active" }
+      { id: "S001", title: "Feedback Fundamentals", description: "Learn core principles of giving and receiving constructive feedback in a collaborative setting.", date: "2026-05-07", time: "1:00 PM", duration: 90, category: "Netflix Workshop", capacity: 25, externalEntityCap: 5, restrictedToEntity: "", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarEventId: "", status: "Active" },
+      { id: "S002", title: "Feedback Fundamentals", description: "Learn core principles of giving and receiving constructive feedback in a collaborative setting.", date: "2026-05-07", time: "4:00 PM", duration: 90, category: "Netflix Workshop", capacity: 25, externalEntityCap: 5, restrictedToEntity: "", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarEventId: "", status: "Active" },
+      { id: "S003", title: "Feedback Fundamentals", description: "Learn core principles of giving and receiving constructive feedback in a collaborative setting.", date: "2026-05-07", time: "7:00 PM", duration: 90, category: "Netflix Workshop", capacity: 25, externalEntityCap: 5, restrictedToEntity: "", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarEventId: "", status: "Active" },
+      { id: "S004", title: "Feedback in Practice — Small Group", description: "Hands-on practice session with live feedback exercises and coaching in a small group format.", date: "2026-05-14", time: "9:00 AM", duration: 90, category: "Netflix Workshop", capacity: 20, externalEntityCap: 5, restrictedToEntity: "", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarEventId: "", status: "Active" },
+      { id: "S005", title: "Feedback in Practice — Small Group", description: "Hands-on practice session with live feedback exercises and coaching in a small group format.", date: "2026-05-14", time: "12:00 PM", duration: 90, category: "Netflix Workshop", capacity: 20, externalEntityCap: 5, restrictedToEntity: "", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarEventId: "", status: "Active" },
+      { id: "S006", title: "Feedback in Practice — Small Group", description: "Hands-on practice session with live feedback exercises and coaching in a small group format.", date: "2026-05-14", time: "3:00 PM", duration: 90, category: "Netflix Workshop", capacity: 20, externalEntityCap: 5, restrictedToEntity: "", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarEventId: "", status: "Active" },
+      { id: "S007", title: "Animation Studio: Feedback Foundations", description: "Tailored feedback workshop for Netflix Animation Studio teams.", date: "2026-05-21", time: "10:00 AM", duration: 90, category: "Animation Studio Workshop", capacity: 10, externalEntityCap: 0, restrictedToEntity: "Netflix Animation Studio", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarEventId: "", status: "Active" },
+      { id: "S008", title: "Animation Studio: Feedback Foundations", description: "Tailored feedback workshop for Netflix Animation Studio teams.", date: "2026-05-21", time: "1:00 PM", duration: 90, category: "Animation Studio Workshop", capacity: 10, externalEntityCap: 0, restrictedToEntity: "Netflix Animation Studio", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarEventId: "", status: "Active" },
+      { id: "S009", title: "Eyeline: Feedback Foundations", description: "Tailored feedback workshop for Eyeline teams.", date: "2026-05-28", time: "10:00 AM", duration: 90, category: "Eyeline Workshop", capacity: 10, externalEntityCap: 0, restrictedToEntity: "Eyeline", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarEventId: "", status: "Active" },
+      { id: "S010", title: "Eyeline: Feedback Foundations", description: "Tailored feedback workshop for Eyeline teams.", date: "2026-05-28", time: "1:00 PM", duration: 90, category: "Eyeline Workshop", capacity: 10, externalEntityCap: 0, restrictedToEntity: "Eyeline", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarEventId: "", status: "Active" },
+      { id: "S011", title: "Advanced Feedback: Difficult Conversations", description: "Navigate challenging feedback scenarios with confidence. Covers upward feedback, cross-functional dynamics, and high-stakes situations.", date: "2026-06-04", time: "1:00 PM", duration: 90, category: "Netflix Workshop", capacity: 25, externalEntityCap: 5, restrictedToEntity: "", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarEventId: "", status: "Active" },
+      { id: "S012", title: "Advanced Feedback: Difficult Conversations", description: "Navigate challenging feedback scenarios with confidence. Covers upward feedback, cross-functional dynamics, and high-stakes situations.", date: "2026-06-04", time: "4:00 PM", duration: 90, category: "Netflix Workshop", capacity: 25, externalEntityCap: 5, restrictedToEntity: "", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarEventId: "", status: "Active" },
+      { id: "S013", title: "Advanced Feedback: Difficult Conversations", description: "Navigate challenging feedback scenarios with confidence. Covers upward feedback, cross-functional dynamics, and high-stakes situations.", date: "2026-06-04", time: "7:00 PM", duration: 90, category: "Netflix Workshop", capacity: 25, externalEntityCap: 5, restrictedToEntity: "", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarEventId: "", status: "Active" },
+      { id: "S014", title: "Feedback Culture Deep Dive", description: "Explore how to embed a feedback-first culture within your team. Interactive discussion and action planning.", date: "2026-06-18", time: "9:00 AM", duration: 60, category: "Netflix Workshop", capacity: 20, externalEntityCap: 5, restrictedToEntity: "", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarEventId: "", status: "Active" },
+      { id: "S015", title: "Feedback Culture Deep Dive", description: "Explore how to embed a feedback-first culture within your team. Interactive discussion and action planning.", date: "2026-06-18", time: "12:00 PM", duration: 60, category: "Netflix Workshop", capacity: 20, externalEntityCap: 5, restrictedToEntity: "", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarEventId: "", status: "Active" },
+      { id: "S016", title: "Feedback Culture Deep Dive", description: "Explore how to embed a feedback-first culture within your team. Interactive discussion and action planning.", date: "2026-06-18", time: "3:00 PM", duration: 60, category: "Netflix Workshop", capacity: 20, externalEntityCap: 5, restrictedToEntity: "", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarEventId: "", status: "Active" },
+      { id: "S017", title: "Animation Studio: Advanced Feedback", description: "Advanced feedback techniques tailored for Animation Studio creative teams.", date: "2026-06-25", time: "10:00 AM", duration: 90, category: "Animation Studio Workshop", capacity: 10, externalEntityCap: 0, restrictedToEntity: "Netflix Animation Studio", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarEventId: "", status: "Active" },
+      { id: "S018", title: "Animation Studio: Advanced Feedback", description: "Advanced feedback techniques tailored for Animation Studio creative teams.", date: "2026-06-25", time: "1:00 PM", duration: 90, category: "Animation Studio Workshop", capacity: 10, externalEntityCap: 0, restrictedToEntity: "Netflix Animation Studio", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarEventId: "", status: "Active" },
+      { id: "S019", title: "Eyeline: Advanced Feedback", description: "Advanced feedback techniques tailored for Eyeline teams.", date: "2026-07-02", time: "10:00 AM", duration: 90, category: "Eyeline Workshop", capacity: 10, externalEntityCap: 0, restrictedToEntity: "Eyeline", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarEventId: "", status: "Active" },
+      { id: "S020", title: "Eyeline: Advanced Feedback", description: "Advanced feedback techniques tailored for Eyeline teams.", date: "2026-07-02", time: "1:00 PM", duration: 90, category: "Eyeline Workshop", capacity: 10, externalEntityCap: 0, restrictedToEntity: "Eyeline", meetingLink: "", location: "Virtual — Zoom link will be provided", calendarEventId: "", status: "Active" }
     ],
     registrations: []
   };
@@ -224,14 +249,17 @@ app.post("/api/register", (req, res) => {
   data.registrations.push(reg);
   saveData(data);
 
-  // Auto-add to Google Calendar if confirmed and calendar is configured
-  if (status === "Confirmed" && session.calendarId && session.calendarEventId) {
-    addGuestToCalendarEvent(session.calendarId, session.calendarEventId, email, name)
-      .catch(e => console.error("Calendar add failed:", e));
+  // Auto-add to Google Calendar if confirmed
+  const calId = data.settings.calendarId;
+  if (status === "Confirmed" && calId) {
+    findCalendarEvent(calId, session).then(eventId => {
+      if (eventId) addGuestToCalendarEvent(calId, eventId, email, name);
+    }).catch(e => console.error("Calendar add failed:", e));
   }
 
+  const calMsg = (status === "Confirmed" && calId) ? " A calendar invite will be sent to your email." : "";
   const message = status === "Confirmed"
-    ? `You're confirmed for "${session.title}" on ${session.date} at ${session.time} PT.` + (session.calendarId && session.calendarEventId ? " A calendar invite has been sent to your email." : "")
+    ? `You're confirmed for "${session.title}" on ${session.date} at ${session.time} PT.` + calMsg
     : `You've been added to the waitlist for "${session.title}". We'll notify you if a spot opens up.`;
 
   res.json({ success: true, status, message });
@@ -249,13 +277,14 @@ app.post("/api/cancel", (req, res) => {
   const wasConfirmed = reg.status === "Confirmed";
   data.registrations[regIndex].status = "Cancelled";
 
-  // Find the session for calendar operations
   const cancelSession = data.sessions.find(s => s.id === reg.sessionId);
+  const calId = data.settings.calendarId;
 
-  // Remove from Google Calendar if configured
-  if (wasConfirmed && cancelSession && cancelSession.calendarId && cancelSession.calendarEventId) {
-    removeGuestFromCalendarEvent(cancelSession.calendarId, cancelSession.calendarEventId, reg.email)
-      .catch(e => console.error("Calendar remove failed:", e));
+  // Remove from Google Calendar
+  if (wasConfirmed && calId && cancelSession) {
+    findCalendarEvent(calId, cancelSession).then(eventId => {
+      if (eventId) removeGuestFromCalendarEvent(calId, eventId, reg.email);
+    }).catch(e => console.error("Calendar remove failed:", e));
   }
 
   // Promote from waitlist if confirmed spot freed
@@ -267,10 +296,10 @@ app.post("/api/cancel", (req, res) => {
       const idx = data.registrations.findIndex(r => r.id === waitlisted[0].id);
       if (idx !== -1) {
         data.registrations[idx].status = "Confirmed";
-        // Add promoted person to Google Calendar
-        if (cancelSession && cancelSession.calendarId && cancelSession.calendarEventId) {
-          addGuestToCalendarEvent(cancelSession.calendarId, cancelSession.calendarEventId, data.registrations[idx].email, data.registrations[idx].name)
-            .catch(e => console.error("Calendar promote-add failed:", e));
+        if (calId && cancelSession) {
+          findCalendarEvent(calId, cancelSession).then(eventId => {
+            if (eventId) addGuestToCalendarEvent(calId, eventId, data.registrations[idx].email, data.registrations[idx].name);
+          }).catch(e => console.error("Calendar promote-add failed:", e));
         }
       }
     }
@@ -294,7 +323,7 @@ app.get("/api/my-registrations", (req, res) => {
 // --- Admin: Add session ---
 app.post("/api/admin/sessions", (req, res) => {
   const data = loadData();
-  const session = { id: "S" + generateId(), ...req.body, status: "Active" };
+  const session = { id: "S" + generateId(), ...req.body, calendarEventId: "", status: "Active" };
   data.sessions.push(session);
   saveData(data);
   res.json({ success: true, id: session.id });
@@ -427,6 +456,144 @@ app.get("/api/calendar/:sessionId", (req, res) => {
   res.setHeader("Content-Type", "text/calendar; charset=utf-8");
   res.setHeader("Content-Disposition", 'attachment; filename="' + session.title.replace(/[^a-zA-Z0-9 ]/g, "") + '.ics"');
   res.send(ics);
+});
+
+// --- Daily Digest Email ---
+app.get("/api/digest", async (req, res) => {
+  // Protect with a secret key
+  const digestKey = process.env.DIGEST_KEY || "digest2026";
+  if (req.query.key !== digestKey) return res.status(403).json({ error: "Invalid key" });
+
+  const apiKey = process.env.RESEND_API_KEY;
+  const digestTo = process.env.DIGEST_EMAIL || "";
+  if (!apiKey || !digestTo) return res.status(500).json({ error: "Email not configured. Set RESEND_API_KEY and DIGEST_EMAIL in Render environment variables." });
+
+  const data = loadData();
+  const activeSessions = data.sessions.filter(s => s.status === "Active");
+  const activeRegs = data.registrations.filter(r => r.status !== "Cancelled");
+
+  const totalConfirmed = activeRegs.filter(r => r.status === "Confirmed").length;
+  const totalWaitlisted = activeRegs.filter(r => r.status === "Waitlisted").length;
+  const uniqueEmails = [...new Set(activeRegs.map(r => r.email))].length;
+
+  // Registrations from last 24 hours
+  const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const newRegs = activeRegs.filter(r => r.timestamp > oneDayAgo);
+
+  // Build session summary
+  let sessionRows = "";
+  activeSessions.sort((a, b) => a.date.localeCompare(b.date) || a.time.localeCompare(b.time));
+  activeSessions.forEach(s => {
+    const sRegs = activeRegs.filter(r => r.sessionId === s.id);
+    const confirmed = sRegs.filter(r => r.status === "Confirmed").length;
+    const waitlisted = sRegs.filter(r => r.status === "Waitlisted").length;
+    const pct = Math.round((confirmed / s.capacity) * 100);
+    const barColor = pct >= 90 ? "#C62828" : pct >= 70 ? "#E65100" : "#2E7D32";
+    sessionRows += `<tr>
+      <td style="padding:8px 12px;border-bottom:1px solid #eee;font-weight:600">${s.title}</td>
+      <td style="padding:8px 12px;border-bottom:1px solid #eee">${s.date} · ${s.time} PT</td>
+      <td style="padding:8px 12px;border-bottom:1px solid #eee">
+        <div style="display:flex;align-items:center;gap:8px">
+          <div style="background:#eee;border-radius:4px;width:80px;height:12px;overflow:hidden">
+            <div style="background:${barColor};height:100%;width:${pct}%"></div>
+          </div>
+          <span style="font-size:13px;font-weight:600">${confirmed}/${s.capacity}</span>
+        </div>
+      </td>
+      <td style="padding:8px 12px;border-bottom:1px solid #eee;color:#888">${waitlisted > 0 ? waitlisted + " waitlisted" : "—"}</td>
+    </tr>`;
+  });
+
+  // New registrations detail
+  let newRegRows = "";
+  if (newRegs.length > 0) {
+    newRegs.forEach(r => {
+      newRegRows += `<tr>
+        <td style="padding:6px 12px;border-bottom:1px solid #eee">${r.name}</td>
+        <td style="padding:6px 12px;border-bottom:1px solid #eee">${r.email}</td>
+        <td style="padding:6px 12px;border-bottom:1px solid #eee">${r.sessionTitle}</td>
+        <td style="padding:6px 12px;border-bottom:1px solid #eee">${r.entity}</td>
+        <td style="padding:6px 12px;border-bottom:1px solid #eee">
+          <span style="background:${r.status === "Confirmed" ? "#E8F5E9" : "#FFF3E0"};color:${r.status === "Confirmed" ? "#2E7D32" : "#E65100"};padding:2px 8px;border-radius:4px;font-size:12px;font-weight:600">${r.status}</span>
+        </td>
+      </tr>`;
+    });
+  }
+
+  const today = new Date().toLocaleDateString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric" });
+
+  const html = `
+  <div style="max-width:640px;margin:0 auto;font-family:Arial,sans-serif;color:#333">
+    <div style="background:#1a1a1a;padding:24px 32px;border-radius:12px 12px 0 0">
+      <p style="color:#C62828;font-size:11px;font-weight:700;letter-spacing:1px;margin:0 0 4px">FEEDBACK WORKSHOPS · UCAN</p>
+      <h1 style="color:#fff;font-size:22px;margin:0">Daily Registration Digest</h1>
+      <p style="color:#999;font-size:14px;margin:4px 0 0">${today}</p>
+    </div>
+    <div style="background:#fff;padding:24px 32px;border:1px solid #eee">
+      <div style="display:flex;gap:16px;margin-bottom:24px">
+        <div style="flex:1;background:#F5F5F5;padding:16px;border-radius:8px;text-align:center">
+          <div style="font-size:28px;font-weight:700;color:#1a1a1a">${totalConfirmed}</div>
+          <div style="font-size:12px;color:#888;margin-top:4px">Confirmed</div>
+        </div>
+        <div style="flex:1;background:#F5F5F5;padding:16px;border-radius:8px;text-align:center">
+          <div style="font-size:28px;font-weight:700;color:#E65100">${totalWaitlisted}</div>
+          <div style="font-size:12px;color:#888;margin-top:4px">Waitlisted</div>
+        </div>
+        <div style="flex:1;background:#F5F5F5;padding:16px;border-radius:8px;text-align:center">
+          <div style="font-size:28px;font-weight:700;color:#0D47A1">${uniqueEmails}</div>
+          <div style="font-size:12px;color:#888;margin-top:4px">Unique People</div>
+        </div>
+        <div style="flex:1;background:#F5F5F5;padding:16px;border-radius:8px;text-align:center">
+          <div style="font-size:28px;font-weight:700;color:#2E7D32">${newRegs.length}</div>
+          <div style="font-size:12px;color:#888;margin-top:4px">New (24hr)</div>
+        </div>
+      </div>
+      <h2 style="font-size:16px;margin:0 0 12px;color:#1a1a1a">Session Fill Rates</h2>
+      <table style="width:100%;border-collapse:collapse;font-size:13px">
+        <thead><tr style="background:#F5F5F5">
+          <th style="padding:8px 12px;text-align:left">Session</th>
+          <th style="padding:8px 12px;text-align:left">Date & Time</th>
+          <th style="padding:8px 12px;text-align:left">Filled</th>
+          <th style="padding:8px 12px;text-align:left">Waitlist</th>
+        </tr></thead>
+        <tbody>${sessionRows}</tbody>
+      </table>
+      ${newRegs.length > 0 ? `
+      <h2 style="font-size:16px;margin:24px 0 12px;color:#1a1a1a">New Registrations (Last 24 Hours)</h2>
+      <table style="width:100%;border-collapse:collapse;font-size:13px">
+        <thead><tr style="background:#F5F5F5">
+          <th style="padding:6px 12px;text-align:left">Name</th>
+          <th style="padding:6px 12px;text-align:left">Email</th>
+          <th style="padding:6px 12px;text-align:left">Session</th>
+          <th style="padding:6px 12px;text-align:left">Entity</th>
+          <th style="padding:6px 12px;text-align:left">Status</th>
+        </tr></thead>
+        <tbody>${newRegRows}</tbody>
+      </table>` : `<p style="color:#888;font-size:13px;margin-top:24px">No new registrations in the last 24 hours.</p>`}
+    </div>
+    <div style="background:#F5F5F5;padding:16px 32px;border-radius:0 0 12px 12px;text-align:center">
+      <p style="font-size:12px;color:#999;margin:0">Feedback Workshop Registration Portal · Netflix Talent Management · L&D</p>
+    </div>
+  </div>`;
+
+  try {
+    const emailRes = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + apiKey },
+      body: JSON.stringify({
+        from: "Feedback Workshops <onboarding@resend.dev>",
+        to: digestTo.split(",").map(e => e.trim()),
+        subject: "📊 Workshop Registration Digest — " + today,
+        html: html,
+      }),
+    });
+    const result = await emailRes.json();
+    console.log("Digest sent:", result);
+    res.json({ success: true, to: digestTo, newRegistrations: newRegs.length, totalConfirmed, totalWaitlisted });
+  } catch (e) {
+    console.error("Digest error:", e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // --- Fallback to index.html ---
